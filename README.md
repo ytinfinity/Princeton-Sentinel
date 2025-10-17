@@ -344,10 +344,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [FastAPI](https://fastapi.tiangolo.com/) - For the modern Python web framework
 - Princeton Insurance - For trusting AI to answer their phones
 
-## 📞 Support
-
-- **Issues:** [GitHub Issues](https://github.com/yourusername/Princeton-sentinel/issues)
-- **Email:** your-email@example.com
 
 ---
 
