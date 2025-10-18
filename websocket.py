@@ -51,6 +51,11 @@ async def handle_media_stream(websocket: WebSocket):
     print("Client connected to Princeton Insurance system")
     await websocket.accept()
 
+    # Initialize - will be populated from Twilio's 'start' event
+    caller_phone = ""
+    call_sid = ""
+    stream_sid = None
+
     # buffers for function args (call_id -> json string)
     function_arg_buffers: Dict[str, str] = {}
 
@@ -61,8 +66,6 @@ async def handle_media_stream(websocket: WebSocket):
         await initialize_session(openai_ws)
 
         # per-connection state
-        stream_sid = None
-        call_sid = None
         transferred = False
         latest_media_timestamp = 0
         last_assistant_item = None
@@ -71,7 +74,7 @@ async def handle_media_stream(websocket: WebSocket):
         last_interruption_time = 0
 
         async def receive_from_twilio():
-            nonlocal stream_sid, call_sid, latest_media_timestamp
+            nonlocal stream_sid, call_sid, caller_phone, latest_media_timestamp
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -89,10 +92,57 @@ async def handle_media_stream(websocket: WebSocket):
 
                     elif data["event"] == "start":
                         stream_sid = data["start"]["streamSid"]
-                        call_sid = data["start"].get("callSid")
+                        call_sid = data["start"].get("callSid", "")
+
+                        # ⭐ Extract caller info from customParameters
+                        custom_params = data["start"].get("customParameters", {})
+                        caller_phone = custom_params.get("caller_phone", "")
+
+                        # ⭐ ENHANCED LOGGING - This is where caller info gets logged
+                        print("=" * 70, flush=True)
+                        print("🔵 PRINCETON INSURANCE CALL STARTED", flush=True)
+                        print("=" * 70, flush=True)
                         print(
-                            f"Princeton Insurance call stream started: {stream_sid} (CallSid={call_sid})"
+                            f"📞 CALLER PHONE:  {caller_phone or '⚠️ MISSING'}",
+                            flush=True,
                         )
+                        print(f"📋 CALL SID:      {call_sid}", flush=True)
+                        print(f"🌊 STREAM SID:    {stream_sid}", flush=True)
+                        print(f"📦 CUSTOM PARAMS: {custom_params}", flush=True)
+                        print("=" * 70, flush=True)
+
+                        # ⭐ Validation - warn if caller_phone is missing
+                        if not caller_phone:
+                            print(
+                                "⚠️⚠️⚠️ WARNING: caller_phone is EMPTY! Check TwiML <Parameter> tags ⚠️⚠️⚠️",
+                                flush=True,
+                            )
+
+                        # ⭐ Update OpenAI session metadata with caller info
+                        try:
+                            await openai_ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "session.update",
+                                        "session": {
+                                            "metadata": {
+                                                "caller_phone": caller_phone,
+                                                "call_sid": call_sid,
+                                                "stream_sid": stream_sid,
+                                            }
+                                        },
+                                    }
+                                )
+                            )
+                            print(
+                                f"✅ Updated OpenAI session metadata with caller: {caller_phone}",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            print(
+                                f"❌ Failed to update session metadata: {e}", flush=True
+                            )
+
                         reset_state()
 
                     elif data["event"] == "mark":
@@ -100,7 +150,12 @@ async def handle_media_stream(websocket: WebSocket):
                             mark_queue.pop(0)
 
             except WebSocketDisconnect:
-                print("Princeton Insurance client disconnected.")
+                print("=" * 70, flush=True)
+                print(
+                    f"🔴 CALL DISCONNECTED - Caller: {caller_phone}, CallSid: {call_sid}",
+                    flush=True,
+                )
+                print("=" * 70, flush=True)
                 if openai_ws.state.name == "OPEN":
                     await openai_ws.close()
 
@@ -264,12 +319,23 @@ async def handle_media_stream(websocket: WebSocket):
 
                         # Handle each tool
                         if tool_name == "record_call_data":
+                            # ⭐ Use the caller_phone we captured from start event
+                            phone_out = (
+                                args.get("caller_phone") or caller_phone or ""
+                            ).strip()
+
+                            print(
+                                f"📝 Recording call data for: {phone_out}", flush=True
+                            )
+
                             tool_output = insert_call_record(
-                                caller_phone=args.get("caller_phone", ""),
+                                caller_phone=phone_out,
                                 task_type=args.get("task_type", ""),
                                 call_summary=args.get("call_summary", ""),
                                 detail_info=args.get("detail_info", ""),
                             )
+
+                            print(f"✅ Call record inserted: {tool_output}", flush=True)
 
                         elif tool_name == "check_status":
                             # simple deterministic mock: line 1 busy, others free
@@ -283,6 +349,10 @@ async def handle_media_stream(websocket: WebSocket):
                             }
 
                         elif tool_name == "end_call":
+                            print(
+                                f"📞 Ending call - Reason: {args.get('reason', 'N/A')}",
+                                flush=True,
+                            )
                             tool_output = {
                                 "ended": True,
                                 "reason": args.get("reason", ""),
@@ -301,7 +371,6 @@ async def handle_media_stream(websocket: WebSocket):
                                         "ok": False,
                                         "error": f"invalid line_number: {line_number}",
                                     }
-                                    # allow model to continue after error
                                     await openai_ws.send(
                                         json.dumps({"type": "response.create"})
                                     )
@@ -316,8 +385,14 @@ async def handle_media_stream(websocket: WebSocket):
                                 tool_output = {"ok": False, "error": "missing_call_sid"}
                             else:
                                 try:
+                                    print(
+                                        f"📞 Transferring {caller_phone} to {target}...",
+                                        flush=True,
+                                    )
+
                                     # Redirect active leg to our TwiML route
                                     transfer_call_via_url(call_sid, target)
+
                                     # Wait for Dial action webhook to set final status
                                     timeout_sec = 70
                                     poll_every = 0.5
@@ -339,6 +414,10 @@ async def handle_media_stream(websocket: WebSocket):
                                         waited += poll_every
 
                                     if final_status in ("answered", "completed"):
+                                        print(
+                                            f"✅ Transfer successful: {final_status}",
+                                            flush=True,
+                                        )
                                         tool_output = {
                                             "ok": True,
                                             "transferred_to": target,
@@ -349,28 +428,34 @@ async def handle_media_stream(websocket: WebSocket):
                                             await openai_ws.close()
                                         except Exception:
                                             pass
-                                        # IMPORTANT: do not send response.create after closing
                                     elif final_status in (
                                         "busy",
                                         "no-answer",
                                         "failed",
                                     ):
+                                        print(
+                                            f"❌ Transfer failed: {final_status}",
+                                            flush=True,
+                                        )
                                         tool_output = {
                                             "ok": False,
                                             "transferred_to": target,
                                             "status": final_status,
                                             "error": "transfer_failed",
                                         }
-                                        # keep session alive so Sally can offer fallback
                                     else:
+                                        print(
+                                            f"⏳ Transfer timeout: {final_status}",
+                                            flush=True,
+                                        )
                                         tool_output = {
                                             "ok": True,
                                             "transferred_to": target,
                                             "status": "pending_timeout",
                                         }
-                                        # keep session alive; model can say we'll follow up if needed
 
                                 except Exception as e:
+                                    print(f"❌ Transfer error: {e}", flush=True)
                                     tool_output = {"ok": False, "error": str(e)}
 
                         else:
@@ -380,6 +465,20 @@ async def handle_media_stream(websocket: WebSocket):
                             }
 
                         print(f"[FUNCTION] Tool output: {tool_output}", flush=True)
+
+                        # Send function output back to OpenAI
+                        await openai_ws.send(
+                            json.dumps(
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": cid,
+                                        "output": json.dumps(tool_output),
+                                    },
+                                }
+                            )
+                        )
 
                         # Continue conversation if not transferred
                         if not transferred:
