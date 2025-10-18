@@ -319,17 +319,29 @@ async def handle_media_stream(websocket: WebSocket):
 
                         # Handle each tool
                         if tool_name == "record_call_data":
-                            # ⭐ Use the caller_phone we captured from start event
-                            phone_out = (
-                                args.get("caller_phone") or caller_phone or ""
-                            ).strip()
+                            # 🚫 Never trust the model's caller_phone. Always use the server's.
+                            def normalize_e164(num: str) -> str:
+                                # very light normalization; tweak as needed
+                                return num.replace(" ", "").replace("-", "")
+
+                            server_phone = normalize_e164(caller_phone or "")
+                            if (
+                                not server_phone.startswith("+")
+                                or len(server_phone) < 8
+                            ):
+                                # Fail fast if we truly don't have it; better than saving a fake number.
+                                raise RuntimeError(
+                                    f"Missing/invalid server caller_phone: '{server_phone}'. "
+                                    "Refusing to insert with placeholder."
+                                )
 
                             print(
-                                f"📝 Recording call data for: {phone_out}", flush=True
+                                f"📝 Recording call data for: {server_phone}",
+                                flush=True,
                             )
 
                             tool_output = insert_call_record(
-                                caller_phone=phone_out,
+                                caller_phone=server_phone,  # ← force the real one
                                 task_type=args.get("task_type", ""),
                                 call_summary=args.get("call_summary", ""),
                                 detail_info=args.get("detail_info", ""),
